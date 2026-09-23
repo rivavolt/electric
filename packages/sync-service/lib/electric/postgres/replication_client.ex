@@ -484,14 +484,14 @@ defmodule Electric.Postgres.ReplicationClient do
       # with keepalives to avoid it getting filled with irrelevant changes, like
       # heartbeats from the database provider
       1 ->
-        state = update_stored_wals(state, wal_end)
+        state = update_stored_wals(state, last_byte(wal_end))
         {:noreply, [encode_standby_status_update(state)], state}
 
       0 when in_transaction? ->
         {:noreply, [], state}
 
       0 ->
-        state = update_stored_wals(state, wal_end)
+        state = update_stored_wals(state, last_byte(wal_end))
         {:noreply, [], state}
     end
   end
@@ -623,6 +623,15 @@ defmodule Electric.Postgres.ReplicationClient do
           Lsn.from_integer(state.last_confirmed_flush_lsn) == state.last_seen_txn_lsn
     }
   end
+
+  # received_wal and flushed_wal hold the last byte consumed, and the status update reports
+  # the byte after it, as the protocol asks. A keepalive's wal_end is already the position
+  # after the last byte sent, so it is stored as the byte before it. Storing wal_end itself
+  # made every keepalive-driven report one past what the server sent, and a walsender only
+  # finishes at shutdown once the client's flush position equals what it sent, so a clean
+  # stop of the primary waited on Electric until it was killed.
+  defp last_byte(wal_end) when wal_end > 0, do: wal_end - 1
+  defp last_byte(wal_end), do: wal_end
 
   defp encode_standby_status_update(state) do
     Logger.debug(fn ->
