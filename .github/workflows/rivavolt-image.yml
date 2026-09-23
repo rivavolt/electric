@@ -1,0 +1,88 @@
+# rivavolt fork of the sync service at 1.8.1 with one fix (see the branch's commits): keepalive-driven feedback reports the exact position the server sent, so a primary's walsender can finish at shutdown. Builds the image and proves the shutdown fix against the unpatched 1.8.1 as a control.
+name: rivavolt image
+
+on:
+  push:
+    branches: ['rivavolt-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/rivavolt/electric
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the patched image for the test (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: packages/sync-service
+          file: packages/sync-service/Dockerfile
+          build-contexts: electric-telemetry=packages/electric-telemetry
+          build-args: ELECTRIC_VERSION=1.8.1-rivavolt
+          load: true
+          tags: electric-patched:test
+      - name: A fast shutdown of a PG17 primary with Electric attached, control then patched
+        run: |
+          set -euo pipefail
+          measure() {
+            img=$1; name=$2
+            docker network create "net-$name" >/dev/null
+            docker run -d --name "pg-$name" --network "net-$name" -e POSTGRES_PASSWORD=p postgres:17 -c wal_level=logical >/dev/null
+            until docker exec "pg-$name" pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+            docker exec "pg-$name" psql -U postgres -c "create table t (id int primary key, v text)" >/dev/null
+            docker run -d --name "el-$name" --network "net-$name" -e DATABASE_URL="postgresql://postgres:p@pg-$name:5432/postgres?sslmode=disable" -e ELECTRIC_INSECURE=true "$img" >/dev/null
+            for i in $(seq 1 120); do
+              a=$(docker exec "pg-$name" psql -U postgres -Atc "select count(*) from pg_replication_slots where active and slot_type='logical'" 2>/dev/null || echo 0)
+              [ "$a" = 1 ] && break; sleep 1
+            done
+            docker exec "pg-$name" psql -U postgres -c "insert into t select g, 'x' from generate_series(1,100) g" >/dev/null
+            sleep 20
+            docker exec "pg-$name" psql -U postgres -Atc "select 'sent=' || sent_lsn || ' flush=' || flush_lsn from pg_stat_replication"
+            start=$(date +%s.%N)
+            docker stop -t 45 "pg-$name" >/dev/null
+            end=$(date +%s.%N)
+            secs=$(echo "$end - $start" | bc)
+            echo "$name: fast shutdown took ${secs}s"
+            docker logs "pg-$name" 2>&1 | tail -3
+            docker rm -f "el-$name" "pg-$name" >/dev/null; docker network rm "net-$name" >/dev/null
+            echo "$secs" > "/tmp/$name.secs"
+          }
+          measure electricsql/electric:1.8.1 control
+          measure electric-patched:test patched
+          control=$(cat /tmp/control.secs); patched=$(cat /tmp/patched.secs)
+          echo "control ${control}s, patched ${patched}s"
+          awk -v p="$patched" 'BEGIN{exit !(p < 5)}' || { echo "patched shutdown not under 5 s"; exit 1; }
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tag
+        run: echo "tag=1.8.1-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: packages/sync-service
+          file: packages/sync-service/Dockerfile
+          build-contexts: electric-telemetry=packages/electric-telemetry
+          build-args: ELECTRIC_VERSION=1.8.1-rivavolt
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: org.opencontainers.image.source=https://github.com/rivavolt/electric
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
